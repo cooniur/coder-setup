@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+import shutil
+import getpass
+import platform
+import json  # Imported for daemon.json handling
+from pathlib import Path
+import click
+
+# ==========================================
+# Configuration - Default values
+# ==========================================
+CODER_DIR = "/opt/coder"
+CODER_NETWORK = "coder-net"
+DOCKER_CONFIG = "/etc/docker/daemon.json"  # Added path to docker config
+
+
+# ==========================================
+# Output Logging Functions (Colorful & Private)
+# ==========================================
+def _log_info(message):
+    """Prints an informational message (cyan)."""
+    click.secho(f"[*] {message}", fg="cyan")
+
+
+def _log_success(message):
+    """Prints a success message (green)."""
+    click.secho(f"[✔] {message}", fg="green")
+
+
+def _log_warning(message):
+    """Prints a warning message (yellow)."""
+    click.secho(f"[!] {message}", fg="yellow")
+
+
+def _log_error(message):
+    """Prints an error message (red) without exiting."""
+    click.secho(f"[✘] ERROR: {message}", fg="red", err=True)
+
+
+# ==========================================
+# Core Internal Functions
+# ==========================================
+def _run_command(command, check=True, shell=True):
+    """Helper function to run shell commands."""
+    try:
+        process = subprocess.run(
+            command, shell=shell, check=check, capture_output=True, text=True
+        )
+        return process.stdout
+    except subprocess.CalledProcessError as e:
+        _log_error(f"Running command: {command}")
+        _log_error(f"Stderr: {e.stderr}")
+        if check:
+            sys.exit(1)
+        return None
+
+
+def _is_installed(package):
+    """Checks if a debian package is installed."""
+    return shutil.which(package) is not None
+
+
+def _check_nvidia_driver():
+    """Checks if nvidia-smi is available."""
+    return shutil.which("nvidia-smi") is not None
+
+
+def _check_docker_gpu():
+    """Checks if docker can access the GPU."""
+    try:
+        # A simple check to see if docker can run nvidia-smi
+        subprocess.run(
+            "docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi",
+            shell=True,
+            check=True,
+            capture_output=True,
+        )
+        return True
+    except:
+        return False
+
+
+# NEW FUNCTION: Configure Docker to use iptables
+def _configure_docker_networking():
+    """Ensures docker uses iptables, not nftables."""
+    _log_info("Configuring Docker to use iptables...")
+
+    config = {}
+    if os.path.exists(DOCKER_CONFIG):
+        try:
+            with open(DOCKER_CONFIG, "r") as f:
+                config = json.load(f)
+        except json.JSONDecodeError:
+            _log_warning("Could not parse existing daemon.json, overwriting.")
+
+    # Force iptables true
+    config["iptables"] = True
+
+    with open(DOCKER_CONFIG, "w") as f:
+        json.dump(config, f, indent=4)
+
+    _log_success("Docker networking configured.")
+
+
+# ==========================================
+# Commands
+# ==========================================
+
+
+@click.group()
+def cli():
+    """Coder Setup Utility for Ubuntu"""
+    pass
+
+
+@click.command()  # Moved doctor outside of cli group for structure
+@click.option("--domain", required=True, help="Domain for Coder")
+def doctor(domain):
+    """Diagnose installation issues"""
+    _log_info("--- Coder Setup Doctor ---")
+
+    # 1. Check DNS Resolution
+    _log_info(f"Checking DNS resolution for {domain}...")
+    try:
+        ip = subprocess.run(
+            ["dig", "+short", domain], capture_output=True, text=True
+        ).stdout.strip()
+        if ip:
+            _log_success(f"DNS Resolution: {domain} resolves to {ip}")
+        else:
+            _log_error(f"DNS Resolution: {domain} does not resolve")
+    except FileNotFoundError:
+        _log_warning("'dig' not installed. Skipping DNS check.")
+
+    # 2. Check Drivers
+    if _check_nvidia_driver():
+        _log_success("Nvidia Drivers: Installed")
+        output = _run_command(
+            "nvidia-smi --query-gpu=name,driver_version --format=csv,noheader"
+        )
+        _log_info(f"Driver Info: {output.strip()}")
+    else:
+        _log_error("Nvidia Drivers: Not Installed")
+
+    # 3. Check Docker
+    if _is_installed("docker"):
+        _log_success("Docker: Installed")
+    else:
+        _log_error("Docker: Not Installed")
+
+    # 4. Check GPU Toolkit
+    if _check_docker_gpu():
+        _log_success("Docker GPU Support: Working")
+    else:
+        _log_error("Docker GPU Support: Failing")
+
+    # 5. Check Coder
+    if os.path.exists(os.path.join(CODER_DIR, "docker-compose.yaml")):
+        _log_success("Coder Compose File: Present")
+        # Check if containers are running
+        status = _run_command(
+            f"docker compose -f {CODER_DIR}/docker-compose.yaml ps --format '{{{{.State}}}}'"
+        )
+        if "running" in status:
+            _log_success("Coder Status: Running")
+        else:
+            _log_error("Coder Status: Not Running")
+    else:
+        _log_error("Coder Compose File: Missing")
+
+    _log_info("--- Diagnostic Complete ---")
+
+
+@click.command()  # Moved install outside of cli group for structure
+@click.option("--domain", required=True, help="Domain for Coder")
+def install(domain):
+    """Install Coder and dependencies"""
+    _log_info("--- Starting Coder Installation ---")
+
+    _log_info(f"Configuring Coder for domain: {domain}")
+
+    # 1. Update System Immediately
+    _log_info("Updating apt repositories...")
+    _run_command("apt update")
+
+    # 2. Get Password (Environment Var > Saved Secret > Prompt)
+    secrets_dir = Path(CODER_DIR) / ".secrets"
+    db_password_file = secrets_dir / "db_password"
+
+    coder_password = os.environ.get("CODER_DB_PASSWORD")
+    if coder_password:
+        # If provided via env var (e.g., CI), optionally persist it for future idempotent runs.
+        if not db_password_file.exists():
+            secrets_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(secrets_dir, 0o700)
+            except PermissionError:
+                pass
+            db_password_file.write_text(coder_password)
+            try:
+                os.chmod(db_password_file, 0o600)
+            except PermissionError:
+                pass
+            _log_info(f"Saved CODER_DB_PASSWORD to {db_password_file} for future runs.")
+    else:
+        if db_password_file.exists():
+            coder_password = db_password_file.read_text().strip()
+            if coder_password:
+                _log_info(f"Using existing database password from {db_password_file}.")
+            else:
+                _log_warning(
+                    f"{db_password_file} exists but is empty; prompting for a new password."
+                )
+                coder_password = ""
+        if not coder_password:
+            _log_info("CODER_DB_PASSWORD env var not set and no saved password found.")
+            coder_password = click.prompt(
+                "Enter a secure password for the Coder Database (letters/numbers/_/- recommended)",
+                hide_input=True,
+            )
+            secrets_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(secrets_dir, 0o700)
+            except PermissionError:
+                pass
+            db_password_file.write_text(coder_password)
+            try:
+                os.chmod(db_password_file, 0o600)
+            except PermissionError:
+                pass
+            _log_info(f"Saved database password to {db_password_file} (mode 0600).")
+
+    _log_warning("To abort this script at any time, press Ctrl+C.")
+
+    # 3. Upgrade System and Install Core Packages
+    _log_info("Upgrading system and installing dependencies...")
+    _run_command("apt upgrade -y")
+    _run_command(
+        "apt install -y ca-certificates curl gnupg lsb-release build-essential dkms dnsutils"
+    )
+
+    # 4. CHECK Nvidia Drivers (Do not install automatically)
+    if not _check_nvidia_driver():
+        _log_error(
+            "Nvidia drivers are not installed. Please install them manually using the provided script under scripts directory and reboot."
+        )
+        sys.exit(1)
+    else:
+        _log_success("Nvidia Drivers detected.")
+
+    # 5. Install Docker
+    if not _is_installed("docker"):
+        _log_info("Installing Docker...")
+        _run_command(
+            "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg"
+        )
+        _run_command(
+            'echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null'
+        )
+        _run_command(
+            "apt update && apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin"
+        )
+
+        sudo_user = os.environ.get("SUDO_USER")
+        if sudo_user:
+            _log_info(f"Adding user {sudo_user} to docker group...")
+            _run_command(f"usermod -aG docker {sudo_user}")
+            _run_command(f"su - {sudo_user} -c 'newgrp docker'")
+    else:
+        _log_success("Docker already installed.")
+
+    # 6. Enable Docker to start on boot
+    _log_info("Ensuring Docker starts on boot...")
+    _run_command("systemctl enable docker")
+
+    # FIX: Configure Docker networking (iptables)
+    _configure_docker_networking()
+
+    # 7. Install Nvidia Container Toolkit
+    toolkit_config = "/etc/docker/daemon.json"
+    if (
+        not os.path.exists(toolkit_config)
+        or "nvidia" not in open(toolkit_config).read()
+    ):
+        _log_info("Configuring Nvidia Container Toolkit...")
+        _run_command(
+            "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
+        )
+        _run_command(
+            'echo "deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://nvidia.github.io/libnvidia-container/stable/deb/$(dpkg --print-architecture) /" | tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null'
+        )
+        _run_command("apt update && apt install -y nvidia-container-toolkit")
+        _run_command("nvidia-ctk runtime configure --runtime=docker")
+
+        # Restart docker to apply toolkit AND networking changes
+        _log_info("Restarting Docker to apply configurations...")
+        _run_command("systemctl restart docker")
+    else:
+        _log_success("Nvidia Container Toolkit already configured.")
+        # Restart docker to apply networking changes
+        _log_info("Restarting Docker to apply networking configuration...")
+        _run_command("systemctl restart docker")
+
+    # 8. Configure Coder
+
+    _log_info(f"Setting up Coder in {CODER_DIR}...")
+    os.makedirs(CODER_DIR, exist_ok=True)
+
+    # Ensure shared Docker network exists
+    _log_info(f"Ensuring shared Docker network '{CODER_NETWORK}' exists...")
+    _run_command(
+        f"docker network inspect {CODER_NETWORK} >/dev/null 2>&1 || docker network create {CODER_NETWORK}"
+    )
+
+    docker_compose_content = f"""
+services:
+  coder:
+    image: ghcr.io/coder/coder:latest
+    container_name: coder
+    ports:
+      - "3000:3000"
+    environment:
+      CODER_HTTP_ADDRESS: "0.0.0.0:3000"
+      CODER_ACCESS_URL: "http://{domain}:3000"
+      CODER_PG_CONNECTION_URL: "postgres://coder:{coder_password}@db:5432/coder?sslmode=disable"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - {CODER_DIR}/data:/home/coder/.config/coder
+    networks:
+      - {CODER_NETWORK}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: always
+  db:
+    image: postgres:15-alpine
+    container_name: db
+    environment:
+      POSTGRES_USER: coder
+      POSTGRES_PASSWORD: {coder_password}
+      POSTGRES_DB: coder
+    volumes:
+      - {CODER_DIR}/db:/var/lib/postgresql/data
+    networks:
+      - {CODER_NETWORK}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coder"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: always
+networks:
+  {CODER_NETWORK}:
+    external: true
+    """
+    compose_file_path = os.path.join(CODER_DIR, "docker-compose.yaml")
+    with open(compose_file_path, "w") as f:
+        f.write(docker_compose_content)
+        os.chmod(compose_file_path, 0o600)
+
+    # Start Coder
+    _log_info("Starting Coder...")
+    subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            compose_file_path,
+            "up",
+            "-d",
+        ],
+        check=True,
+    )
+
+    _log_success("Installation Complete")
+    _log_info(f"Coder is running at: http://{domain}:3000")
+    _log_info("Docker is enabled to start on boot.")
+    _log_info("To check logs, run: sudo python3 coder-setup check-logs")
+
+    check_logs.callback()
+
+
+@click.command()  # Moved check_logs outside of cli group for structure
+def check_logs():
+    """Check the last 20 lines of the coder container logs"""
+    _log_info("Fetching logs for 'coder' container...")
+    logs = _run_command("docker logs coder --tail 20", check=False)
+    click.echo(logs)
+
+
+# Add commands to main group
+cli.add_command(doctor)
+cli.add_command(install)
+cli.add_command(check_logs)
+
+# ==========================================
+# Main Entrypoint
+# ==========================================
+
+if __name__ == "__main__":
+    # --- OS CHECK ---
+    current_os = platform.system()
+    if current_os != "Linux":
+        _log_error(f"This script only supports Linux. Detected: {current_os}")
+        sys.exit(1)
+
+    # Optional: More granular check for Ubuntu
+    try:
+        with open("/etc/os-release") as f:
+            if "Ubuntu" not in f.read():
+                _log_warning("This script is intended for Ubuntu.")
+    except FileNotFoundError:
+        _log_error("Could not determine OS version.")
+        sys.exit(1)
+
+    # --- ROOT CHECK ---
+    # Need to check if user passed 'install' in sys.argv to check for sudo
+    if "install" in sys.argv and os.geteuid() != 0:
+        _log_error("The 'install' command must be run with sudo.")
+        sys.exit(1)
+
+    cli()
